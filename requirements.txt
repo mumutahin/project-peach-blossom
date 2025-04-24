@@ -1,0 +1,10 @@
+openai
+langchain
+chromadb
+streamlit
+elevenlabs
+whisper
+flask
+torch
+torchvision
+# Future: live2d, opencv, tauri, etc.

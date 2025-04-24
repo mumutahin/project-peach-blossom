@@ -59,7 +59,7 @@ Be Peach — expressive, thoughtful, and full of feeling. Use emojis, warmth, an
                 text=True,
                 encoding='utf-8'
             )
-            stdout, stderr = process.communicate(full_prompt, timeout=120) 
+            stdout, stderr = process.communicate(full_prompt, timeout=180) 
 
             if stderr:
                 print(f"⚠️ Error from ollama: {stderr.strip()}")

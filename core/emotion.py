@@ -36,7 +36,7 @@ class EmotionState:
         return self.mood
 
     def _decay_mood_if_needed(self):
-        if time.time() - self.last_updated > 300:  # 5 minutes
+        if time.time() - self.last_updated > 300:
             if self.mood not in ["calm", "peaceful"]:
                 self.update_mood("calm")
 

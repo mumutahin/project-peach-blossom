@@ -1,3 +1,4 @@
+#interfaces/chat_ui.py
 def start_chat_ui(llm):
     print("🟢 Peach is online.")
     while True:

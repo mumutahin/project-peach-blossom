@@ -74,7 +74,7 @@ python app.py
 ## ⚙️ Development Phases
 
 - [x] Text conversation + memory (MVP)
-- [ ] Emotion engine + personality responses
+- [x] Emotion engine + personality responses
 - [ ] Voice + video chat integration
 - [ ] Avatar emotion sync
 - [ ] Self-reflection & personality growth

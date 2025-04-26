@@ -1,4 +1,5 @@
 # core/memory.py
+import os
 import time
 import spacy
 import random
@@ -8,10 +9,13 @@ from datetime import datetime
 from chromadb.utils import embedding_functions
 from sentence_transformers import SentenceTransformer
 
+base_dir = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+db_path = os.path.join(base_dir, 'data', 'memory.db')
+
 nlp = spacy.load("en_core_web_sm")
 
 class Memory:
-    def __init__(self, db_name='memory.db', max_history=10):
+    def __init__(self, db_name=db_path, max_history=10):
         self.chat_history = []
         self.episodic_memory = []
         self.max_history = max_history
@@ -24,14 +28,32 @@ class Memory:
         self.semantic_collection = self.chroma_client.get_or_create_collection(name="episodic_memories")
         self.embedding_model = SentenceTransformer("all-MiniLM-L6-v2")
         
-    def decay_episodic_memory(self, decay_interval=3600, decay_rate=0.01):
-        """Decays episodic memory over time. Older memories lose their relevance."""
+    def decay_episodic_memory(self, decay_half_life=86400, min_importance=0.1):
+        """
+        Decays episodic memory over time using exponential decay.
+        Half-life defines how long it takes for a memory's importance to drop by half.
+        """
         now = time.time()
+        decay_factor = lambda elapsed: 0.5 ** (elapsed / decay_half_life)
+        updated_memories = []
+
         for memory in self.episodic_memory:
             elapsed = now - memory["timestamp"]
-            if elapsed > decay_interval:
-                memory["importance"] = max(0.0, memory["importance"] - decay_rate * (elapsed // decay_interval))
-        self.episodic_memory = [mem for mem in self.episodic_memory if mem["importance"] > 0.1]
+            old_importance = memory["importance"]
+            memory["importance"] *= decay_factor(elapsed)
+
+            # Optional: re-categorize if importance changed significantly
+            new_category = self._categorize_memory(memory)
+            if new_category != memory["category"]:
+                memory["category"] = new_category
+
+            if memory["importance"] >= min_importance:
+                updated_memories.append(memory)
+                self._update_episodic_in_sqlite(memory)
+            else:
+                print(f"[Memory Decay] Letting go of: '{memory['content'][:30]}...'")
+
+        self.episodic_memory = updated_memories
 
     def mood_decay(self):
         if self.emotion_engine:
@@ -88,6 +110,7 @@ class Memory:
         self.emotion_engine = emotion_engine
 
     def recall(self):
+        os.makedirs("data", exist_ok=True)
         cursor = self.sqlite_conn.cursor()
         cursor.execute('SELECT role, content, mood, timestamp FROM chat_history ORDER BY timestamp DESC LIMIT ?', (self.max_history,))
         rows = cursor.fetchall()
@@ -101,6 +124,7 @@ class Memory:
             return {"chat": self.recall(), "episodic": self.get_episodic_memories()}
 
     def get_episodic_memories(self):
+        os.makedirs("data", exist_ok=True)
         cursor = self.sqlite_conn.cursor()
         cursor.execute('SELECT time, content, mood, tags, importance, relation, category, timestamp FROM episodic_memory ORDER BY timestamp DESC LIMIT 20')
         rows = cursor.fetchall()
@@ -116,6 +140,7 @@ class Memory:
     def delete_memory(self, keyword=None, tag=None):
         if not keyword and not tag:
             return
+        os.makedirs("data", exist_ok=True)
         cursor = self.sqlite_conn.cursor()
         if keyword:
             cursor.execute("DELETE FROM episodic_memory WHERE content LIKE ?", (f"%{keyword}%",))
@@ -125,17 +150,28 @@ class Memory:
         print("[Memory Deletion] Entries deleted based on filter.")
 
     def _save_chat_to_sqlite(self, entry):
+        os.makedirs("data", exist_ok=True)
         cursor = self.sqlite_conn.cursor()
         cursor.execute('INSERT INTO chat_history VALUES (?, ?, ?, ?)',
                        (entry["role"], entry["content"], entry.get("mood"), entry["timestamp"]))
         self.sqlite_conn.commit()
 
     def _save_episodic_to_sqlite(self, mem):
+        os.makedirs("data", exist_ok=True)
         cursor = self.sqlite_conn.cursor()
         cursor.execute('INSERT INTO episodic_memory VALUES (?, ?, ?, ?, ?, ?, ?, ?)',
                        (mem["time"], mem["content"], mem["mood"],
                         ",".join(mem["tags"]), mem["importance"],
                         mem["relation_to_user"], mem["category"], mem["timestamp"]))
+        self.sqlite_conn.commit()
+
+    def _update_episodic_in_sqlite(self, mem):
+        cursor = self.sqlite_conn.cursor()
+        cursor.execute('''
+            UPDATE episodic_memory
+            SET importance = ?, category = ?
+            WHERE timestamp = ?
+        ''', (mem["importance"], mem["category"], mem["timestamp"]))
         self.sqlite_conn.commit()
 
     def scan_for_emotional_triggers(self, llm):
@@ -265,6 +301,7 @@ class Memory:
         return llm.generate_response(context)
 
     def _create_tables(self):
+        os.makedirs("data", exist_ok=True)
         cursor = self.sqlite_conn.cursor()
         cursor.execute('''
             CREATE TABLE IF NOT EXISTS chat_history (

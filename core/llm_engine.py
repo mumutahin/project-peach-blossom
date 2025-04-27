@@ -65,16 +65,41 @@ class LLMEngine:
         return " ".join(sentences)
 
     def generate_response(self, prompt: str) -> str:
-        self.emotion.update_mood_based_on_input(prompt)
+        now = time.time()
+        recent_messages = self.memory.recall()
+
+        if recent_messages and recent_messages[-1]['role'] == 'user':
+            time_since_last = now - recent_messages[-1]['timestamp']
+        else:
+            time_since_last = 0
+
+        depth = "deep" if len(prompt.split()) > 20 else "casual"
+
+        low_energy_keywords = ["tired", "exhausted", "drained", "overwhelmed", "burned out", "sleepy"]
+        user_energy = "low" if any(kw in prompt.lower() for kw in low_energy_keywords) else "normal"
+
+        relationship_status = "close" if len(recent_messages) > 10 else "new"
+
+        context = {
+            "relationship_status": relationship_status,
+            "user_energy": user_energy,
+            "conversation_depth": depth,
+            "time_since_last": time_since_last,
+        }
+        self.emotion.update_mood_based_on_input(prompt, context)
         mood = self.emotion.current_mood()
-        style = self.emotion.choose_response_style()
+        style = self.emotion.choose_response_style(context)
         self.memory.remember("user", prompt, mood)
 
         lowered_prompt = prompt.lower()
         if any(kw in lowered_prompt for kw in ["how have you felt", "reflect", "mood lately", "how do you feel today"]):
             reflection = self.emotion.self_reflect()
+            if self.memory.episodic_memory:
+                memory = random.choice(self.memory.episodic_memory[-10:])
+                poetic = self.memory.poetic_memory_summary(memory)
+                reflection = f"{poetic}\n\n🪞 Peach reflects: {reflection}"
             self.memory.remember("assistant", reflection)
-            return f"🪞 Peach reflects: {reflection}"
+            return reflection
 
         recent_messages = self.memory.recall()
 

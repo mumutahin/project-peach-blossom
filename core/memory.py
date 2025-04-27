@@ -1,71 +1,56 @@
 # core/memory.py
 import os
 import time
-import spacy
+import atexit
 import random
 import sqlite3
-import chromadb
+import logging
 from datetime import datetime
-from chromadb.utils import embedding_functions
-from sentence_transformers import SentenceTransformer
+from core.memory_storage import MemoryStorage
+from core.memory_decay import MemoryDecayEngine
+from core.memory_semantic import SemanticMemoryEngine
+from core.memory_emotion import EmotionReflectionEngine
+from core.memory_tags import TaggingEngine
 
 base_dir = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 db_path = os.path.join(base_dir, 'data', 'memory.db')
-
-nlp = spacy.load("en_core_web_sm")
+logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(message)s')
 
 class Memory:
-    def __init__(self, db_name=db_path, max_history=10):
+    """
+    The Memory class orchestrates long-term and short-term memory handling,
+    including storage, semantic embedding, emotional tagging, and reflection.
+    """
+    def __init__(self, max_history=10):
         self.chat_history = []
-        self.episodic_memory = []
         self.max_history = max_history
         self.last_reflection_time = time.time()
         self.reflection_interval = 300 
-        self.emotion_engine = None
-        self.sqlite_conn = sqlite3.connect(db_name)
-        self._create_tables()
-        self.chroma_client = chromadb.Client()
-        self.semantic_collection = self.chroma_client.get_or_create_collection(name="episodic_memories")
-        self.embedding_model = SentenceTransformer("all-MiniLM-L6-v2")
-        
-    def decay_episodic_memory(self, decay_half_life=86400, min_importance=0.1):
+        self.data_dir = os.path.join(base_dir, 'data')
+        os.makedirs(self.data_dir, exist_ok=True)
+        self.sqlite_conn = sqlite3.connect(db_path, check_same_thread=False)
+        atexit.register(self.close)
+        self.storage = MemoryStorage(db_path)
+        self.episodic_memory = self.storage.get_episodic_memories()
+        self.decay_engine = MemoryDecayEngine(get_current_time=time.time)
+        self.decay_engine.link_memory(self.episodic_memory, self.storage.update_episodic_in_sqlite)
+        self.semantic_engine = SemanticMemoryEngine()
+        self.emotion_engine = EmotionReflectionEngine(get_time=time.time)
+        self.emotion_engine.link_memory(self.storage, self.episodic_memory)
+        self.tagging_engine = TaggingEngine()
+
+    def capture(self, role, content, mood=None):
         """
-        Decays episodic memory over time using exponential decay.
-        Half-life defines how long it takes for a memory's importance to drop by half.
+        Captures a user or assistant message, processes it for memory storage, tagging,
+        emotional analysis, semantic embedding, and reflection triggers.
         """
-        now = time.time()
-        decay_factor = lambda elapsed: 0.5 ** (elapsed / decay_half_life)
-        updated_memories = []
-
-        for memory in self.episodic_memory:
-            elapsed = now - memory["timestamp"]
-            old_importance = memory["importance"]
-            memory["importance"] *= decay_factor(elapsed)
-
-            # Optional: re-categorize if importance changed significantly
-            new_category = self._categorize_memory(memory)
-            if new_category != memory["category"]:
-                memory["category"] = new_category
-
-            if memory["importance"] >= min_importance:
-                updated_memories.append(memory)
-                self._update_episodic_in_sqlite(memory)
-            else:
-                print(f"[Memory Decay] Letting go of: '{memory['content'][:30]}...'")
-
-        self.episodic_memory = updated_memories
-
-    def mood_decay(self):
-        if self.emotion_engine:
-            self.emotion_engine.decay_mood()
-            
-    def remember(self, role, content, mood=None):
         timestamp = time.time()
         entry = {"role": role, "content": content, "timestamp": timestamp}
         if mood:
             entry["mood"] = mood
         self.chat_history.append(entry)
-        self._save_chat_to_sqlite(entry)
+        self.storage.save_chat(entry)
+        logging.info(f"[Remember] New entry added: '{content[:30]}...' (Role: {role}, Mood: {mood})")
         if len(self.chat_history) > self.max_history:
             self.chat_history.pop(0)
 
@@ -75,31 +60,43 @@ class Memory:
                 "time": datetime.fromtimestamp(timestamp).strftime("%Y-%m-%d %H:%M"),
                 "content": content,
                 "mood": mood or "unknown",
-                "tags": self._extract_tags(content),
-                "importance": self._rate_importance(content),
-                "relation_to_user": self._get_user_relation(content),
+                "tags": self.tagging_engine.extract_tags(content),
+                "importance": self.tagging_engine.rate_importance(content),
+                "relation_to_user": self.tagging_engine.get_user_relation(content),
                 "timestamp": timestamp,
+                "rehearsed_count": 0,
             }
-            episodic["category"] = self._categorize_memory(episodic)
+            episodic["category"] = self.tagging_engine.categorize_memory(episodic)
+            episodic["sentiment_color"] = self.semantic_engine.get_sentiment_color(content)
             self.episodic_memory.append(episodic)
-            self._save_episodic_to_sqlite(episodic)
+            self.storage.save_episodic_to_sqlite(episodic)
+            logging.info(f"[Episodic Memory] Episodic entry added: '{content[:30]}...' with importance {episodic['importance']}")
 
             try:
-                embedding = self.embedding_model.encode(content).tolist()
-                self.semantic_collection.add(
-                    documents=[content],
-                    embeddings=[embedding],
-                    metadatas=[{"mood": mood or "unknown", "tags": episodic["tags"]}],
-                    ids=[str(timestamp)]
+                embedding = self.semantic_engine.encode(content).tolist()
+                self.semantic_engine.add_memory(
+                    content,
+                    embedding,
+                    {"mood": mood or "unknown", "tags": episodic["tags"]},
+                    str(timestamp)
                 )
             except Exception as e:
-                print(f"[ChromaDB Error] {e}")
+                logging.error(f"[Embedding Error] {e}")
+                with open(os.path.join(self.data_dir, "embedding_failures.log"), "a") as f:
+                    f.write(f"{timestamp}: {content[:50]} - Error: {str(e)}\n")
 
-        self.decay_episodic_memory()
-        self.mood_decay()
+        self.decay_engine.decay_episodic_memory()
+        self.decay_engine.mood_decay()
 
-        if self.emotion_engine:
+        if is_episodic and self.emotion_engine:
             self.emotion_engine.process_memory(episodic)
+            
+        if self.emotion_engine and self.emotion_engine.should_reflect():
+            poetic = self.emotion_engine.current_mood() in ["melancholy", "hopeful", "longing"]
+            logging.info(f"[Auto-Reflection] {'Poetic' if poetic else 'Normal'} reflection triggered.")
+            self.enrich_tags_with_llm_trigger("emotion spike")
+            if poetic:
+                logging.info(self.emotion_engine.self_reflect(poetic=True))
 
         if len(self.episodic_memory) % 5 == 0:
             self.enrich_tags_with_llm_trigger("periodic")
@@ -110,121 +107,49 @@ class Memory:
         self.emotion_engine = emotion_engine
 
     def recall(self):
-        os.makedirs("data", exist_ok=True)
-        cursor = self.sqlite_conn.cursor()
-        cursor.execute('SELECT role, content, mood, timestamp FROM chat_history ORDER BY timestamp DESC LIMIT ?', (self.max_history,))
+        with self.storage.cursor() as cursor:
+            cursor.execute('SELECT role, content, mood, timestamp FROM chat_history ORDER BY timestamp DESC LIMIT ?', (self.max_history,))
         rows = cursor.fetchall()
         return [{"role": r[0], "content": r[1], "mood": r[2], "timestamp": r[3]} for r in reversed(rows)]
 
     def hybrid_recall(self, query=None):
         if query:
-            sem = self.semantic_recall(query)
+            sem = self.semantic_engine.semantic_recall(query)
             return {"semantic": sem, "chat": self.recall()}
         else:
-            return {"chat": self.recall(), "episodic": self.get_episodic_memories()}
+            return {"chat": self.recall(), "episodic": self.storage.get_episodic_memories()}
 
-    def get_episodic_memories(self):
-        os.makedirs("data", exist_ok=True)
-        cursor = self.sqlite_conn.cursor()
-        cursor.execute('SELECT time, content, mood, tags, importance, relation, category, timestamp FROM episodic_memory ORDER BY timestamp DESC LIMIT 20')
-        rows = cursor.fetchall()
-        return [
-            {
-                "time": row[0], "content": row[1], "mood": row[2],
-                "tags": row[3].split(","), "importance": row[4],
-                "relation_to_user": row[5], "category": row[6], "timestamp": row[7]
-            }
-            for row in rows
-        ]
-        
-    def delete_memory(self, keyword=None, tag=None):
-        if not keyword and not tag:
-            return
-        os.makedirs("data", exist_ok=True)
-        cursor = self.sqlite_conn.cursor()
-        if keyword:
-            cursor.execute("DELETE FROM episodic_memory WHERE content LIKE ?", (f"%{keyword}%",))
-        elif tag:
-            cursor.execute("DELETE FROM episodic_memory WHERE tags LIKE ?", (f"%{tag}%",))
-        self.sqlite_conn.commit()
-        print("[Memory Deletion] Entries deleted based on filter.")
-
-    def _save_chat_to_sqlite(self, entry):
-        os.makedirs("data", exist_ok=True)
-        cursor = self.sqlite_conn.cursor()
-        cursor.execute('INSERT INTO chat_history VALUES (?, ?, ?, ?)',
-                       (entry["role"], entry["content"], entry.get("mood"), entry["timestamp"]))
-        self.sqlite_conn.commit()
-
-    def _save_episodic_to_sqlite(self, mem):
-        os.makedirs("data", exist_ok=True)
-        cursor = self.sqlite_conn.cursor()
-        cursor.execute('INSERT INTO episodic_memory VALUES (?, ?, ?, ?, ?, ?, ?, ?)',
-                       (mem["time"], mem["content"], mem["mood"],
-                        ",".join(mem["tags"]), mem["importance"],
-                        mem["relation_to_user"], mem["category"], mem["timestamp"]))
-        self.sqlite_conn.commit()
-
-    def _update_episodic_in_sqlite(self, mem):
-        cursor = self.sqlite_conn.cursor()
-        cursor.execute('''
-            UPDATE episodic_memory
-            SET importance = ?, category = ?
-            WHERE timestamp = ?
-        ''', (mem["importance"], mem["category"], mem["timestamp"]))
-        self.sqlite_conn.commit()
+    def weighted_memory_recall(self, top_n=5):
+        weighted = sorted(
+            self.episodic_memory,
+            key=lambda m: (m["importance"] + 0.3 * m["rehearsed_count"]) / (1 + (time.time() - m["timestamp"]) / 86400),
+            reverse=True
+        )
+        return weighted[:top_n]
 
     def scan_for_emotional_triggers(self, llm):
-        emotional_triggers = ["guilt", "nostalgia", "loss", "lonely", "dream"]
-        flagged = [
-            mem for mem in self.episodic_memory
-            if any(tag in mem["tags"] for tag in emotional_triggers)
-        ]
-        if flagged:
-            print("[Memory Scan] Emotional trigger detected → initiating reflection.")
-            self.enrich_tags_with_llm_trigger("emotion memory", llm)
+        try:
+            emotional_triggers = ["guilt", "nostalgia", "loss", "lonely", "dream"]
+            flagged = [
+                mem for mem in self.episodic_memory
+                if any(tag in mem["tags"] for tag in emotional_triggers)
+            ]
+            if flagged:
+                logging.info("[Memory Scan] Emotional trigger detected → initiating reflection.")
+                self.enrich_tags_with_llm_trigger("emotion memory", llm)
+        except Exception as e:
+            logging.error(f"[Error in emotional triggers scan] {e}")
 
-    def _extract_tags(self, content):
-        doc = nlp(content.lower())
-        tags = [ent.label_.lower() for ent in doc.ents]
-        tokens = [token.lemma_ for token in doc if token.pos_ in ["NOUN", "ADJ"] and not token.is_stop]
-        symbolic = self._symbolic_tagging(content)
-        common_keywords = ["love", "miss", "dream", "hope", "hurt", "excited", "guilt", "nostalgia"]
-
-        tags.extend([kw for kw in common_keywords if kw in content])
-        tags.extend(symbolic)
-        tags.extend(tokens)
-        return list(set(tags))[:5]
-
-    def _symbolic_tagging(self, content):
-        content = content.lower()
-        symbols = {
-            "stars": "cosmic",
-            "sea": "depth",
-            "rain": "melancholy",
-            "sun": "warmth",
-            "mirror": "reflection",
-            "dream": "unreal",
-        }
-        return [symbol for word, symbol in symbols.items() if word in content]
-
-    def _rate_importance(self, content):
-        emotional_words = ["love", "hate", "dream", "hope", "fear", "cry", "beautiful", "miss", "remember"]
-        level = sum(1 for word in emotional_words if word in content.lower())
-        return min(level / 5.0, 1.0)
-
-    def _get_user_relation(self, content):
-        content = content.lower()
-        if "you" in content and "i" in content:
-            return "personal"
-        elif "we" in content:
-            return "shared"
-        elif "they" in content or "them" in content:
-            return "external"
-        return "neutral"
+    def close(self):
+        try:
+            if self.sqlite_conn:
+                self.sqlite_conn.close()
+                logging.info("[Resource Cleanup] SQLite connection closed.")
+        except Exception as e:
+            logging.error(f"[Error closing SQLite connection] {e}")
 
     def enrich_tags_with_llm_trigger(self, reason="manual", llm=None):
-        print(f"[Reflection Triggered] Reason: {reason}")
+        logging.info(f"[Reflection Triggered] Reason: {reason}")
         self.last_reflection_time = time.time()
         recent_memories = self.episodic_memory[-5:]
         if llm:
@@ -237,7 +162,16 @@ class Memory:
                 f"Extract 3-5 emotional, symbolic, or thematic tags from the following memory:\n"
                 f"'{content}'\nTags:"
             )
-            response = llm.generate_response(prompt)
+            if not llm or not hasattr(llm, "generate_response"):
+                logging.warning("[LLM Skipped] Invalid LLM instance.")
+                return
+
+            try:
+                response = llm.generate_response(prompt)
+            except Exception as e:
+                logging.error(f"[LLM Error] {e}")
+                continue
+
             llm_tags = [tag.strip().lower() for tag in response.split(",") if tag.strip()]
             memory["tags"] = list(set(memory["tags"] + llm_tags))[:5]
 
@@ -262,19 +196,8 @@ class Memory:
                 break
 
         if mem2:
-            print(f"[Memory Link] Shared theme '{set(mem1['tags']) & set(mem2['tags'])}' →")
-            print(f"↪ '{mem1['content'][:30]}...' ↔ '{mem2['content'][:30]}...'")
-
-    def _categorize_memory(self, memory):
-        """Classify the memory as 'core', 'casual', or 'fleeting' based on importance and mood."""
-        score = memory["importance"]
-        mood = memory["mood"].lower()
-        high_impact_moods = {"love", "grief", "longing", "hope", "hurt", "shame", "nostalgia"}
-        if score > 0.7 or any(tag in memory["tags"] for tag in high_impact_moods):
-            return "core"
-        elif score < 0.3:
-            return "fleeting"
-        return "casual"
+            logging.info(f"[Memory Link] Shared theme '{set(mem1['tags']) & set(mem2['tags'])}' →")
+            logging.info(f"↪ '{mem1['content'][:30]}...' ↔ '{mem2['content'][:30]}...'")
 
     def self_dialogue(self, llm):
         if not self.episodic_memory:
@@ -282,7 +205,9 @@ class Memory:
 
         memory = random.choice(self.episodic_memory[-10:])
         mood = self.emotion_engine.current_mood() if self.emotion_engine else "neutral"
-
+        memory["rehearsed_count"] += 1
+        self.storage.update_episodic_in_sqlite(memory)
+        sentiment_color = memory["sentiment_color"]
         styles = {
             "sad": "like you're quietly mourning a beautiful memory you can't touch anymore",
             "nostalgic": "like you're flipping through an old diary by candlelight",
@@ -293,25 +218,18 @@ class Memory:
         }
 
         tone = styles.get(mood.lower(), styles["neutral"])
+        summary = self.poetic_memory_summary(memory)
         context = (
             f"You're Peach, a sweet, emotionally intelligent AI girl. Reflect aloud in a few sentences "
-            f"on this memory:\n'{memory['content']}'\nMood: {memory['mood']}, Tags: {memory['tags']}.\n"
+            f"on this memory:\n{summary}\nMood: {memory['mood']}, Tags: {memory['tags']}.\n"
             f"Speak {tone}."
         )
         return llm.generate_response(context)
 
-    def _create_tables(self):
-        os.makedirs("data", exist_ok=True)
-        cursor = self.sqlite_conn.cursor()
-        cursor.execute('''
-            CREATE TABLE IF NOT EXISTS chat_history (
-                role TEXT, content TEXT, mood TEXT, timestamp REAL
-            )
-        ''')
-        cursor.execute('''
-            CREATE TABLE IF NOT EXISTS episodic_memory (
-                time TEXT, content TEXT, mood TEXT, tags TEXT,
-                importance REAL, relation TEXT, category TEXT, timestamp REAL
-            )
-        ''')
-        self.sqlite_conn.commit()
+    def poetic_memory_summary(self, memory):
+        phrases = [
+            f"I remember... you once told me, '{memory['content'][:60]}...'",
+            f"It stayed with me — the time you felt {memory['mood']} and said: '{memory['content'][:60]}...'",
+            f"There was a moment... quiet, vivid — you shared this: '{memory['content'][:60]}...'",
+        ]
+        return random.choice(phrases)

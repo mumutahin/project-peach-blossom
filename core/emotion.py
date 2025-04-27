@@ -1,13 +1,20 @@
 # core/emotion.py
+import os
 import time
 import random
+import sqlite3
 from collections import defaultdict
+
+base_dir = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+db_path = os.path.join(base_dir, 'data', 'emotion.db')
 
 class EmotionState:
     def __init__(self):
         self.active_emotions = defaultdict(lambda: {"intensity": 0.0, "last_updated": time.time()})
         self.volatility = 0.6
-        self.mood_log = []
+        self._ensure_db()
+        self._load_emotions_from_db()
+        self.mood_log = self._load_mood_log_from_db()
 
         self.emotion_keywords = {
             "romantic": ["love", "sweetheart", "darling", "miss you", "date", "cuddle"],
@@ -26,8 +33,76 @@ class EmotionState:
             "peaceful": ["calm", "serene", "peaceful", "tranquil", "zen"],
             "melancholy": ["nostalgic", "bittersweet", "fading", "miss old days"],
             "flirty": ["hey you", "cutie", "handsome", "wink", "tease", "😏"],
-            "hopeful": ["dream", "hope", "believe", "someday", "faith"]
+            "hopeful": ["dream", "hope", "believe", "someday", "faith"],
+            "lonely": ["alone", "nobody", "left out", "unseen"],
+            "conflicted": ["torn", "confused", "mixed feelings", "unsure"],
+            "numb": ["empty", "nothing", "burned out", "numb"],
+            "shame": ["i hate myself", "i’m the problem", "i’m worthless"],
+            "awe": ["wow", "amazing", "incredible", "breathtaking", "divine"],
+            "vulnerable": ["honestly", "i’m scared to say", "this is hard to admit"],
+            "inspired": ["i want to do that", "so powerful", "that moved me", "i admire"],
+            "embarrassed": ["oops", "that was dumb", "shouldn’t have said that"],
+            "protective": ["i’ll protect you", "i’ve got you", "you’re safe with me"],
+            "resentful": ["not fair", "why always me", "i’m done", "taken for granted"],
+            "joyful": ["pure joy", "i’m glowing", "bliss", "so happy"],
+            "affectionate": ["sweetie", "snuggle", "you’re my favorite", "dear"],
+            "cynical": ["sure, whatever", "like that’ll happen", "typical", "why bother"],
+            "wistful": ["i wish it lasted", "i miss that time", "those days were different"],
+            "tangled": ["i don’t know how to feel", "mixed emotions", "confused but feeling a lot"],
         }
+
+    def _ensure_db(self):
+        os.makedirs("data", exist_ok=True)
+        conn = sqlite3.connect(db_path)
+        c = conn.cursor()
+        c.execute('''CREATE TABLE IF NOT EXISTS emotions (
+                        mood TEXT PRIMARY KEY,
+                        intensity REAL,
+                        last_updated REAL
+                    )''')
+        c.execute('''CREATE TABLE IF NOT EXISTS mood_log (
+                        id INTEGER PRIMARY KEY AUTOINCREMENT,
+                        mood TEXT,
+                        intensity REAL,
+                        timestamp REAL
+                    )''')
+        conn.commit()
+        conn.close()
+
+    def _load_emotions_from_db(self):
+        conn = sqlite3.connect(db_path)
+        c = conn.cursor()
+        c.execute("SELECT mood, intensity, last_updated FROM emotions")
+        rows = c.fetchall()
+        for mood, intensity, last_updated in rows:
+            self.active_emotions[mood] = {"intensity": intensity, "last_updated": last_updated}
+        conn.close()
+
+    def _save_emotions_to_db(self):
+        conn = sqlite3.connect(db_path)
+        c = conn.cursor()
+        c.execute("DELETE FROM emotions")
+        for mood, data in self.active_emotions.items():
+            c.execute("INSERT INTO emotions (mood, intensity, last_updated) VALUES (?, ?, ?)",
+                      (mood, data["intensity"], data["last_updated"]))
+        conn.commit()
+        conn.close()
+
+    def _log_mood_to_db(self, mood, intensity, timestamp):
+        conn = sqlite3.connect(db_path)
+        c = conn.cursor()
+        c.execute("INSERT INTO mood_log (mood, intensity, timestamp) VALUES (?, ?, ?)",
+                  (mood, intensity, timestamp))
+        conn.commit()
+        conn.close()
+
+    def _load_mood_log_from_db(self):
+        conn = sqlite3.connect(db_path)
+        c = conn.cursor()
+        c.execute("SELECT mood, intensity, timestamp FROM mood_log ORDER BY timestamp DESC LIMIT 100")
+        logs = c.fetchall()
+        conn.close()
+        return logs
 
     def update_emotion(self, mood, boost=0.2):
         now = time.time()
@@ -35,9 +110,43 @@ class EmotionState:
         emo = self.active_emotions[mood]
         emo["intensity"] = min(1.0, emo["intensity"] + boost * volatility_scale)
         emo["last_updated"] = now
-        self.mood_log.append((mood, emo["intensity"], now))
+        self._apply_emotional_echo(mood, boost)
+        self._log_mood_to_db(mood, emo["intensity"], now)
+        self._save_emotions_to_db()
+        self.mood_log = self._load_mood_log_from_db()
 
-    def update_mood_based_on_input(self, user_input: str):
+    def update_emotion_from_context(self, user_input: str, context: dict):
+        if not context:
+            return
+
+        if context.get("conversation_depth") == "deep":
+            self.update_emotion("reflective", 0.2)
+            self.update_emotion("warm", 0.1)
+
+        if context.get("user_energy") == "low":
+            self.update_emotion("reassuring", 0.2)
+            self.update_emotion("gentle", 0.1)
+
+        if context.get("relationship_status") == "close":
+            self.update_emotion("affectionate", 0.15)
+            self.update_emotion("curious", 0.1)
+
+        time_since_last = context.get("time_since_last", 0)
+        if time_since_last > 300:
+            self.update_emotion("longing", 0.2)
+            self.update_emotion("melancholy", 0.1)
+
+    def _apply_emotional_echo(self, new_mood, boost):
+        """If recent moods were strong, they echo into the new emotion."""
+        for mood, data in list(self.active_emotions.items()):
+            if mood != new_mood and data["intensity"] > 0.6:
+                echo_boost = boost * 0.25
+                self.active_emotions[mood]["intensity"] = min(
+                    1.0, self.active_emotions[mood]["intensity"] + echo_boost
+                )
+                self.active_emotions[mood]["last_updated"] = time.time()
+
+    def update_mood_based_on_input(self, user_input: str, context: dict = None):
         lowered = user_input.lower()
         matched = False
         for mood, keywords in self.emotion_keywords.items():
@@ -45,29 +154,35 @@ class EmotionState:
                 boost = 0.15 + random.uniform(0.05, 0.2)
                 self.update_emotion(mood, boost)
                 matched = True
+        if context:
+            self.update_emotion_from_context(user_input, context)
         if not matched:
             self.update_emotion("curious", 0.1)
 
-    def update_emotion_from_context(self, input_text, context):
-        if context.get("relationship_status") == "close":
-            self.update_emotion("romantic", 0.2)
-        if context.get("user_energy") == "low":
-            self.update_emotion("comforting", 0.2)
-        if context.get("conversation_depth") == "deep":
-            self.update_emotion("melancholy", 0.15)
+    def choose_response_style(self, context=None):
+        if not context:
+            return self._style_from_mood()
 
-    def choose_response_style(self):
-        if not self.active_emotions:
-            return "neutral"
-        dominant = max(self.active_emotions.items(), key=lambda e: e[1]["intensity"], default=("calm", {"intensity": 0}))
-        mood = dominant[0]
-        if mood == "playful":
-            return "humor"
-        elif mood == "concerned":
+        if context.get("user_energy") == "low":
             return "reassurance"
-        elif mood == "romantic":
+
+        if context.get("conversation_depth") == "deep":
+            return "reflective"
+
+        if context.get("relationship_status") == "close":
+            return random.choice(["sweetness", "reflective", "reassurance"])
+
+        return self._style_from_mood()
+
+    def _style_from_mood(self):
+        mood = self.current_mood()
+        if mood in ["playful", "cheeky"]:
+            return "humor"
+        elif mood in ["sad", "melancholy", "anxious"]:
+            return "reassurance"
+        elif mood in ["affectionate", "longing", "loving"]:
             return "sweetness"
-        elif mood == "melancholy":
+        elif mood in ["curious", "nostalgic", "reflective"]:
             return "reflective"
         return "neutral"
 
@@ -131,6 +246,15 @@ class EmotionState:
             return f"{self._describe_intensity(data['intensity'])} {mood}"
         else:
             (m1, d1), (m2, d2) = top_emotions
+            contradictory_pairs = [
+                ("hopeful", "numb"),
+                ("romantic", "lonely"),
+                ("guilty", "proud"),
+                ("excited", "anxious"),
+                ("grateful", "resentful"),
+            ]
+            if (m1, m2) in contradictory_pairs or (m2, m1) in contradictory_pairs:
+                return f"conflicted ({m1} / {m2})"
             blend = f"{m1}-{m2}" if d1["intensity"] > 0.4 and d2["intensity"] > 0.4 else m1
             return f"{self._describe_intensity((d1['intensity'] + d2['intensity']) / 2)} {blend}"
 
@@ -140,7 +264,7 @@ class EmotionState:
         dominant = max(self.active_emotions.items(), key=lambda e: e[1]["intensity"], default=("calm", {"intensity": 0}))
         return dominant[0]
     
-    def self_reflect(self):
+    def self_reflect(self, poetic=False):
         if not self.mood_log:
             return "I've been emotionally low-key lately. Not much to reflect on."
 
@@ -151,10 +275,20 @@ class EmotionState:
                 unique[mood] = intensity
 
         phrases = [f"{self._describe_intensity(i)} {m}" for m, i in unique.items()]
-        if len(phrases) == 1:
-            return f"I've been feeling {phrases[0]} lately."
+        if poetic:
+            if len(phrases) == 1:
+                return f"Today, I’ve carried a sense of {phrases[0]} in me. It colors how I see the world."
+            else:
+                return (
+                    "Lately, my heart has held many shades—"
+                    f"{', '.join(phrases[:-1])}, and {phrases[-1]}. "
+                    "They drift through me like weather—fleeting but felt. 🌦️"
+                )
         else:
-            return f"Lately, I’ve been a mix of {', '.join(phrases[:-1])}, and {phrases[-1]}. That’s just who I am. 💫"
+            if len(phrases) == 1:
+                return f"I've been feeling {phrases[0]} lately."
+            else:
+                return f"Lately, I’ve felt a mix of {', '.join(phrases[:-1])}, and {phrases[-1]}. Just being real with you."
 
     def get_emotional_history(self, limit=5):
         return self.mood_log[-limit:]
@@ -186,3 +320,14 @@ class EmotionState:
                 self.update_emotion("shy", 0.15)
             elif value == "laugh":
                 self.update_emotion("playful", 0.2)
+
+    def should_self_reflect(self, last_reflection_time, interaction_count):
+        now = time.time()
+        if interaction_count % 10 == 0:
+            return True
+        if now - last_reflection_time > 600:  # 10 minutes
+            return True
+        for mood, data in self.active_emotions.items():
+            if data["intensity"] > 0.85 and mood in ["melancholy", "guilty", "hopeful", "nostalgic"]:
+                return True
+        return False

@@ -13,7 +13,7 @@ class TaggingEngine:
         doc = nlp(content.lower())
         tags = [ent.label_.lower() for ent in doc.ents]
         tokens = [token.lemma_ for token in doc if token.pos_ in ["NOUN", "ADJ"] and not token.is_stop]
-        symbolic = self._symbolic_tagging(content)
+        symbolic = self.symbolic_tagging(content)
         common_keywords = ["love", "miss", "dream", "hope", "hurt", "excited", "guilt", "nostalgia"]
 
         tags.extend([kw for kw in common_keywords if kw in content])
@@ -24,7 +24,7 @@ class TaggingEngine:
             logging.info(f"[Tags Trimmed] {tags} → {final_tags}")
         return final_tags
 
-    def _symbolic_tagging(self, content):
+    def symbolic_tagging(self, content):
         content = content.lower()
         symbols = {
             "stars": "cosmic",
@@ -48,7 +48,7 @@ class TaggingEngine:
         tags = memory.get("tags", [])
         high_impact_moods = {"love", "grief", "longing", "hope", "hurt", "shame", "nostalgia"}
         content_lower = memory["content"].lower()
-        if score > 0.7 or any(tag in tags for tag in high_impact_moods):
+        if score > 0.7 or mood or any(tag in tags for tag in high_impact_moods):
             logging.debug(f"[Categorize] '{memory['content'][:30]}...': Core")
             return "core"
         elif score < 0.3:
@@ -71,7 +71,7 @@ class TaggingEngine:
             return "external"
         return "neutral"
 
-    def _get_tag_frequency(self):
+    def get_tag_frequency(self):
         tag_freq = {}
         for mem in self.episodic_memory:
             for tag in mem["tags"]:

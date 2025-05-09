@@ -1,4 +1,4 @@
-# core/memore_semantic.py
+# core/memory_semantic.py
 import logging
 import chromadb
 from chromadb.utils import embedding_functions

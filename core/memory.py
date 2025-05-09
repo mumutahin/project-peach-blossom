@@ -6,6 +6,7 @@ import random
 import sqlite3
 import logging
 from datetime import datetime
+from core.emotion import EmotionState
 from core.memory_storage import MemoryStorage
 from core.memory_decay import MemoryDecayEngine
 from core.memory_semantic import SemanticMemoryEngine
@@ -25,11 +26,12 @@ class Memory:
         self.chat_history = []
         self.max_history = max_history
         self.last_reflection_time = time.time()
-        self.reflection_interval = 300 
+        self.reflection_interval = 600 
         self.data_dir = os.path.join(base_dir, 'data')
         os.makedirs(self.data_dir, exist_ok=True)
         self.sqlite_conn = sqlite3.connect(db_path, check_same_thread=False)
         atexit.register(self.close)
+        self.emotion = EmotionState()
         self.storage = MemoryStorage(db_path)
         self.episodic_memory = self.storage.get_episodic_memories()
         self.decay_engine = MemoryDecayEngine(get_current_time=time.time)
@@ -86,17 +88,17 @@ class Memory:
                     f.write(f"{timestamp}: {content[:50]} - Error: {str(e)}\n")
 
         self.decay_engine.decay_episodic_memory()
-        self.decay_engine.mood_decay()
+        self.decay_engine.decay_mood()
 
         if is_episodic and self.emotion_engine:
             self.emotion_engine.process_memory(episodic)
             
-        if self.emotion_engine and self.emotion_engine.should_reflect():
-            poetic = self.emotion_engine.current_mood() in ["melancholy", "hopeful", "longing"]
+        if self.emotion_engine and self.emotion.self_reflect():
+            poetic = self.emotion.current_mood() in ["melancholy", "hopeful", "longing"]
             logging.info(f"[Auto-Reflection] {'Poetic' if poetic else 'Normal'} reflection triggered.")
             self.enrich_tags_with_llm_trigger("emotion spike")
             if poetic:
-                logging.info(self.emotion_engine.self_reflect(poetic=True))
+                logging.info(self.emotion.self_reflect(poetic=True))
 
         if len(self.episodic_memory) % 5 == 0:
             self.enrich_tags_with_llm_trigger("periodic")
@@ -204,7 +206,7 @@ class Memory:
             return "I haven't experienced enough yet to reflect on anything... but I’m ready."
 
         memory = random.choice(self.episodic_memory[-10:])
-        mood = self.emotion_engine.current_mood() if self.emotion_engine else "neutral"
+        mood = self.emotion.current_mood() if self.emotion_engine else "neutral"
         memory["rehearsed_count"] += 1
         self.storage.update_episodic_in_sqlite(memory)
         sentiment_color = memory["sentiment_color"]
